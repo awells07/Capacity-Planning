@@ -32,7 +32,7 @@ where a.work_type2_temp not in ('xUnwanted Entry', 'xTrivial', 'xNOT LISTED');
 
 /* 
    Step 2: Task by Work Type aggregation - helps to answer question of: What Work Types are 
-           associated with a given Kaufman Hall Project 
+           associated with a given Task.
 */
 /* Step 2a: Option A: Summary by truncated project name and work type*/
 IF OBJECT_ID('tempdb.dbo.#aw_capacityplanning_task_x_worktype_summary_trunc', 'U') IS NOT NULL DROP TABLE #aw_capacityplanning_task_x_worktype_summary_trunc;
