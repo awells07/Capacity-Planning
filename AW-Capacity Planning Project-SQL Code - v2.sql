@@ -34,7 +34,7 @@ where a.work_type2_temp not in ('xUnwanted Entry', 'xTrivial', 'xNOT LISTED');
    Step 2: Task by Work Type aggregation - helps to answer question of: What Work Types are 
            associated with a given Task.
 */
-/* Step 2a: Option A: Summary by truncated project name and work type*/
+/* Step 2a: Summary by truncated project name and work type*/
 IF OBJECT_ID('tempdb.dbo.#aw_capacityplanning_task_x_worktype_summary_trunc', 'U') IS NOT NULL DROP TABLE #aw_capacityplanning_task_x_worktype_summary_trunc;
 select *, row_number() OVER(PARTITION BY task_type_truncated ORDER BY task_x_worktype_hours desc) AS task_worktype_rank
 into #aw_capacityplanning_task_x_worktype_summary_trunc
@@ -53,7 +53,7 @@ order by 1 desc, row_number() OVER(PARTITION BY task_type_truncated ORDER BY tas
 	create index cp_task_work_idxW on #aw_capacityplanning_task_x_worktype_summary_trunc(work_type2);
 		select * from #aw_capacityplanning_task_x_worktype_summary_trunc; /* 697 rows */
 
-/* summary by work type only */ 
+/* Step 2b: Summary by work type only */ 
 IF OBJECT_ID('tempdb.dbo.#aw_capacityplanning_worktype_summary_trunc', 'U') IS NOT NULL DROP TABLE #aw_capacityplanning_worktype_summary_trunc;
 select *, row_number() OVER(PARTITION BY work_type2 ORDER BY worktype_hours desc) AS worktype_rank
 into #aw_capacityplanning_worktype_summary_trunc
@@ -70,43 +70,104 @@ group by work_type2
 order by 1 desc, row_number() OVER(PARTITION BY work_type2 ORDER BY worktype_hours desc);
 	create index cp_task_work_idxW on #aw_capacityplanning_worktype_summary_trunc(work_type2);
 		select * from #aw_capacityplanning_worktype_summary_trunc; /* 697 rows */
-
-
-/* Step 2b: Option B: Full Project Name 
-IF OBJECT_ID('tempdb.dbo.#aw_capacityplanning_task_x_worktype_summary', 'U') IS NOT NULL DROP TABLE #aw_capacityplanning_task_x_worktype_summary;
-select *, row_number() OVER(PARTITION BY task_type ORDER BY task_x_worktype_hours desc) AS task_worktype_rank
-into #aw_capacityplanning_task_x_worktype_summary
-from
-(
-select distinct a.task_type, work_type2,
-                count(distinct name) as distinct_associates, sum(hours) as task_x_worktype_hours,
-				round(sum(hours) / count(distinct name),2) as hours_per_assoc_x_task_work_types				
-from (select *, PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY hours) OVER (PARTITION BY task_type) AS hours_outlier 
-      from #temp_task_type) a
-where hours > 0 and hours < hours_outlier and work_type2 is not NULL
-group by a.task_type, work_type2
-) a
-order by 1 desc, row_number() OVER(PARTITION BY task_type ORDER BY task_x_worktype_hours desc);
-	create index cp_task_work_idxT on #aw_capacityplanning_task_x_worktype_summary(task_type);
-	create index cp_task_work_idxW on #aw_capacityplanning_task_x_worktype_summary(work_type2);
-		select * from #aw_capacityplanning_task_x_worktype_summary; *//* 1447 rows */
 /* end */
 
 
 /* 
-   Step 3: Create table summarized by associate and work type - answers question regarding where people are spending their time by work type - 
+   Step 3: Compute Herfindahl-Hirschman Index for each task.
+*/
+/* Step 3a: Compute Herfindahl-Hirschman Index - HHI - across Work Types within each Task */
+IF OBJECT_ID('tempdb.dbo.#hhi_by_task', 'U') IS NOT NULL DROP TABLE #hhi_by_task;
+select distinct task_type_truncated, sum(hhi_subcomponent) as task_x_worktype_hhi, 
+                case when sum(hhi_subcomponent)<1500 then 'evenly distributed project'
+				     when sum(hhi_subcomponent) between 1500 and 2500 then 'moderately distributed project' 
+						else 'concentrated project' end as task_x_worktype_hhi_categorized
+into #hhi_by_task
+from
+(
+select distinct a.task_type_truncated, work_type2, task_x_worktype_hours, hrs_total, round(task_x_worktype_hours/hrs_total,5)*100 as hrs_prop, 
+                (round(task_x_worktype_hours/hrs_total,5)*100)*(round(task_x_worktype_hours/hrs_total,5)*100) as hhi_subcomponent
+from #aw_capacityplanning_task_x_worktype_summary_trunc a
+inner join
+    (select distinct task_type_truncated, sum(task_x_worktype_hours) as hrs_total
+     from #aw_capacityplanning_task_x_worktype_summary_trunc
+	 group by task_type_truncated) b
+on a.task_type_truncated=b.task_type_truncated
+--order by 1, 3 desc
+) a
+group by task_type_truncated
+order by 2 desc;
+	create index hhi_task_type_idxT on #hhi_by_task(task_type_truncated);
+		select * from #hhi_by_task; /* 27 rows */
+/* INFO:
+The U.S. Department of Justice considers a market with an HHI of less than 1,500 to be a competitive marketplace, an HHI of 1,500 to 2,500 
+to be a moderately concentrated marketplace, and an HHI of 2,500 or greater to be a highly concentrated marketplace. 
+*/
+
+/* Step 3b: Compute Task-level HHI components, relative to all other Tasks and then compute average, or composite, HHI by Task */
+IF OBJECT_ID('tempdb.dbo.#cp_hhi', 'U') IS NOT NULL DROP TABLE #cp_hhi;
+select a.*, task_x_worktype_hhi, round((task_hours_hhi+task_assoc_hhi+task_worktypes_hhi+task_x_worktype_hhi)/4,2) as composite_task_hhi
+into #cp_hhi
+from
+(
+select a.*, b.*, 
+      (round(a.task_hrs_total/b.total_overall_hours,5)*100)*(round(a.task_hrs_total/b.total_overall_hours,5)*100) as task_hours_hhi,
+      (round(a.task_assoc_total/b.total_associates,5)*100)*(round(a.task_assoc_total/b.total_associates,5)*100) as task_assoc_hhi,
+	  (round(a.task_dist_worktypes_total/b.total_work_types,5)*100)*(round(a.task_dist_worktypes_total/b.total_work_types,5)*100) as task_worktypes_hhi
+from (select distinct task_type_truncated, sum(task_x_worktype_hours) as task_hrs_total, sum(distinct_associates) as task_assoc_total,
+                      count(distinct work_type2) as task_dist_worktypes_total
+      from #aw_capacityplanning_task_x_worktype_summary_trunc
+	  group by task_type_truncated) a,
+     (select sum(task_x_worktype_hours) as total_overall_hours, sum(distinct_associates) as total_associates, count(distinct work_type2) as total_work_types
+	  from #aw_capacityplanning_task_x_worktype_summary_trunc) b
+) a
+left join
+   #hhi_by_task b
+on a.task_type_truncated=b.task_type_truncated;
+	create index chhi_task_type_idxT on #cp_hhi(task_type_truncated);
+		select * from #cp_hhi; /* 27 rows */
+
+/* Step 3c: Compute Work Type-level HHI components, relative to all other Work Types and then compute average, or composite, HHI by Work Type */
+IF OBJECT_ID('tempdb.dbo.#cp_hhi_worktype', 'U') IS NOT NULL DROP TABLE #cp_hhi_worktype;
+select a.*, round((wt_hours_hhi+wt_assoc_hhi+wt_tasktypes_hhi)/3,2) as composite_hhi_worktypes
+into #cp_hhi_worktype
+from
+(
+select a.*, b.*, 
+      (round(a.wt_hrs_total/b.total_overall_hours,5)*100)*(round(a.wt_hrs_total/b.total_overall_hours,5)*100) as wt_hours_hhi,
+      (round(a.wt_assoc_total/b.total_associates,5)*100)*(round(a.wt_assoc_total/b.total_associates,5)*100) as wt_assoc_hhi,
+	  (round(a.wt_dist_tasks_total/b.total_tasks,5)*100)*(round(a.wt_dist_tasks_total/b.total_tasks,5)*100) as wt_tasktypes_hhi
+from (select distinct work_type2, sum(task_x_worktype_hours) as wt_hrs_total, sum(distinct_associates) as wt_assoc_total,
+                      count(distinct task_type_truncated) as wt_dist_tasks_total
+      from #aw_capacityplanning_task_x_worktype_summary_trunc
+	  group by work_type2) a,
+     (select sum(task_x_worktype_hours) as total_overall_hours, sum(distinct_associates) as total_associates, count(distinct task_type_truncated) as total_tasks
+	  from #aw_capacityplanning_task_x_worktype_summary_trunc) b
+) a;
+	create index chhi_wt_type_idxT on #cp_hhi_worktype(work_type2);
+		select * from #cp_hhi_worktype; /* 27 rows */
+/* end */
+
+
+/* 
+   Step 4: Create table summarized by associate and work type - answers question regarding where people are spending their time by work type - 
            can be used to 'infer' an associate's expertise
 */
 IF OBJECT_ID('tempdb.dbo.#aw_capacityplanning_name_work_summary', 'U') IS NOT NULL DROP TABLE #aw_capacityplanning_name_work_summary;
-select *, row_number() OVER(PARTITION BY name ORDER BY total_hours_x_worktype desc) AS worktype_rank
+select *, row_number() OVER(PARTITION BY name ORDER BY /*total_hours_x_worktype*/weighted_worktype_hrs desc) AS worktype_rank
 into #aw_capacityplanning_name_work_summary
+from
+(select a.*, composite_hhi_worktypes, total_hours_x_worktype*composite_hhi_worktypes as weighted_worktype_hrs
 from
 (
 select distinct name, work_type2, sum(hours) as total_hours_x_worktype
 from #temp_task_type
-group by name, work_type2
+group by name, work_type2) a
+left join
+#cp_hhi_worktype b
+on a.work_type2=b.work_type2
 ) a
-order by 1, row_number() OVER(PARTITION BY name ORDER BY total_hours_x_worktype desc);
+order by 1, row_number() OVER(PARTITION BY name ORDER BY /*total_hours_x_worktype*/weighted_worktype_hrs desc);
 	create index cp_assocs_idxN on #aw_capacityplanning_name_work_summary(name);
 	create index cp_assocs_idxW on #aw_capacityplanning_name_work_summary(work_type2);
 		select * from #aw_capacityplanning_name_work_summary order by name, worktype_rank;
@@ -114,26 +175,32 @@ order by 1, row_number() OVER(PARTITION BY name ORDER BY total_hours_x_worktype 
 
 
 /* 
-   Step 4: Create table summarized by associate and task type - answers question regarding where people are spending their time by task type - 
+   Step 5: Create table summarized by associate and task type - answers question regarding where people are spending their time by task type - 
            can be used to 'infer' an associate's expertise
 */
 IF OBJECT_ID('tempdb.dbo.#aw_capacityplanning_name_task_summary', 'U') IS NOT NULL DROP TABLE #aw_capacityplanning_name_task_summary;
-select *, row_number() OVER(PARTITION BY name ORDER BY total_hours_x_tasktype desc) AS tasktype_rank
+select *, row_number() OVER(PARTITION BY name ORDER BY /*total_hours_x_tasktype*/weighted_task_hours desc) AS tasktype_rank
 into #aw_capacityplanning_name_task_summary
+from
+(select a.*, b.composite_task_hhi, a.total_hours_x_tasktype*b.composite_task_hhi as weighted_task_hours
 from
 (
 select distinct name, task_type_truncated, sum(hours) as total_hours_x_tasktype
 from #temp_task_type
 group by name, task_type_truncated
 ) a
-order by 1, row_number() OVER(PARTITION BY name ORDER BY total_hours_x_tasktype desc);
+left join
+#cp_hhi b
+on a.task_type_truncated=b.task_type_truncated
+) a
+order by 1, row_number() OVER(PARTITION BY name ORDER BY /*total_hours_x_tasktype*/weighted_task_hours desc);
 	create index cp_assocs_idxN on #aw_capacityplanning_name_task_summary(name);
 	create index cp_assocs_idxT on #aw_capacityplanning_name_task_summary(task_type_truncated);
 		select * from #aw_capacityplanning_name_task_summary order by name, tasktype_rank;
 /* end */
 
 
-/* Step 5: Create summary of most recent 1 month of work by associate - use this to forecast */
+/* Step 6: Create summary of most recent 1 month of work by associate - use this to forecast */
 IF OBJECT_ID('tempdb.dbo.#temp_assoc_forecast', 'U') IS NOT NULL DROP TABLE #temp_assoc_forecast;
 select distinct a.name, b.task_type_count, count(distinct work_type2) as work_type_count, 
                 sum(weighted_hours_to_go) as weighted_hours_to_go, round(sum(weighted_hours_to_go)/40,1) as weeks_until_free,
